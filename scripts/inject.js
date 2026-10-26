@@ -6693,6 +6693,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function rotationReminderEnabled() {
       try { return localStorage.getItem(rotationReminderKey) !== '0'; } catch (_) { return true; }
     }
+    // [wd-scheduler] 二改：智能调度·自动切换开关（默认关闭，需在账号设置中手动开启）
+    var smartAutoKey = 'workdaddy.account.smartAuto.' + PROFILE_ID;
+    function smartAutoEnabled() {
+      try { return localStorage.getItem(smartAutoKey) === '1'; } catch (_) { return false; }
+    }
     function accountNoteHoverEnabled() {
       try { return localStorage.getItem(WBS_ACCOUNT_NOTE_HOVER_KEY) !== '0'; } catch (_) { return true; }
     }
@@ -6949,6 +6954,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         '<div data-fixed-order>' +
         '<div class="wbs-account-order-list" role="list" aria-label="固定账号顺序"></div></div>' +
         '<label class="wbs-account-settings-toggle"><span>积分不足时的账号切换建议</span><span class="wbs-switch"><input type="checkbox" data-rotation-reminder><span class="wbs-switch-slider"></span></span></label>' +
+        '<label class="wbs-account-settings-toggle"><span>智能调度·自动切换（临期积分优先）</span><span class="wbs-switch"><input type="checkbox" data-smart-auto><span class="wbs-switch-slider"></span></span></label>' +
         '<div class="wbs-account-settings-section">悬浮窗口</div>' +
         '<label class="wbs-account-settings-toggle"><span>鼠标悬浮显示账号备注</span><span class="wbs-switch"><input type="checkbox" data-account-note-hover><span class="wbs-switch-slider"></span></span></label>' +
         '<label class="wbs-account-settings-toggle"><span>鼠标悬浮显示成长计划</span><span class="wbs-switch"><input type="checkbox" data-growth-plan-hover><span class="wbs-switch-slider"></span></span></label>' +
@@ -6959,6 +6965,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var savePersonaSettings = setupPersonaSettings(mask);
       var list = mask.querySelector('.wbs-account-order-list');
       mask.querySelector('[data-rotation-reminder]').checked = rotationReminderEnabled();
+      mask.querySelector('[data-smart-auto]').checked = smartAutoEnabled();
       mask.querySelector('[data-account-note-hover]').checked = accountNoteHoverEnabled();
       mask.querySelector('[data-growth-plan-hover]').checked = growthPlanHoverEnabled();
       var busy = false, dragged = null;
@@ -7038,6 +7045,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       mask.querySelector('[data-order-save]').addEventListener('click', function () {
         if (busy) return;
         var reminder = mask.querySelector('[data-rotation-reminder]').checked;
+        var smartAuto = mask.querySelector('[data-smart-auto]').checked;
         var noteHover = mask.querySelector('[data-account-note-hover]').checked;
         var growthHover = mask.querySelector('[data-growth-plan-hover]').checked;
         busy = true;
@@ -7051,6 +7059,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             var ranks = new Map(); ordered.forEach(function (a, index) { ranks.set(a.uid, index + 1); });
             state.accounts.forEach(function (a) { a.sort = ranks.get(a.uid) || 0; });
             try { localStorage.setItem(rotationReminderKey, reminder ? '1' : '0'); } catch (_) {}
+            try { localStorage.setItem(smartAutoKey, smartAuto ? '1' : '0'); } catch (_) {}
             try { localStorage.setItem(WBS_ACCOUNT_NOTE_HOVER_KEY, noteHover ? '1' : '0'); } catch (_) {}
             try { localStorage.setItem(WBS_GROWTH_PLAN_HOVER_KEY, growthHover ? '1' : '0'); } catch (_) {}
             applyAccountNoteHoverState();
@@ -17218,6 +17227,38 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return Math.max(1, Math.ceil(diff / 86400000)) + ' 天';
     }
 
+    // [wd-scheduler] 二改：智能调度·自动切换。
+    // 开启「智能调度」后，会话结束不再弹建议窗，而是直接询问守护进程选号：
+    // 候选 = 熔断器未打开的账号中，最早到期积分段最靠前（临期优先）者；
+    // 选到即自动调用 /api/switch 完成切换并 toast 告知；切换失败自动给当前账号上报熔断。
+    function autoSmartSwitch() {
+      if (!state.current || !state.current.uid || state.rotationNotice) return;
+      api('/api/scheduler/pick', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uid: state.current.uid, force: true })
+      }).then(function (result) {
+        if (!result || !result.ok) return;
+        var candidate = result.candidate;
+        if (!candidate || !candidate.uid) {
+          var openCount = (Array.isArray(result.breakers) ? result.breakers : []).filter(function (b) { return b && b.open; }).length;
+          if (openCount) toast('智能调度：暂无可切换账号，' + openCount + ' 个账号冷却中', false, root);
+          return;
+        }
+        var currentConversationId = typeof acActiveConversationId === 'function' ? acActiveConversationId() : '';
+        if (!currentConversationId) currentConversationId = acSwitchConversationId();
+        api('/api/switch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid: candidate.uid, reload: true, currentConversationId: currentConversationId || '' }) })
+          .then(function () {
+            toast('智能调度：已自动切换到「' + (candidate.nickname || candidate.uid) + '」（临期积分优先）', false, root);
+            setBuildTimeout(refresh, 1200);
+          })
+          .catch(function (error) {
+            api('/api/scheduler/report', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid: state.current && state.current.uid, ok: false, type: 'switchfail' }) }).catch(function () {});
+            toast('智能调度：切换到「' + (candidate.nickname || candidate.uid) + '」失败，已进入冷却（' + (error.message || error) + '）', true, root);
+          });
+      }).catch(function () {});
+    }
+
     function checkCreditRotationAfterSession() {
       if (!CAPS.accounts || !rotationReminderEnabled() || state.open || state.rotationNotice) return;
       function run() {
@@ -17229,6 +17270,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           body: JSON.stringify({ uid: current.uid, previousSegments: current.creditSegments }),
         }).then(function (result) {
           current.creditSegments = Array.isArray(result && result.current && result.current.segments) ? result.current.segments : current.creditSegments;
+          // [wd-scheduler] 二改：开启智能调度时走自动切换分支，不再弹建议窗
+          if (smartAutoEnabled()) { autoSmartSwitch(); return; }
           if (!result || !result.shouldSuggest || !result.candidate) return;
           showRotationNotice(result.candidate);
         }).catch(function () {});

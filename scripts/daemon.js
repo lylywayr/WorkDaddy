@@ -32,6 +32,7 @@ const { inspectPersona, copyPersona, readPersonaSettings, listPersonaSources, co
 let sessionSync = require('./session-sync.js');
 const {createCodeBuddyFiles} = require('./codebuddy-files.js');
 const { createAccountCreditCache } = require('./account-credit-cache.js');
+const { createSmartScheduler } = require('./smart-scheduler.js'); // [wd-scheduler] 二改：智能调度熔断
 const { spawn, spawnSync, execFile } = require('child_process');
 const { createWallpaperRotation, updateWallpaperInRenderer, pickWallpaperDirectory } = require('./wallpaper-rotation');
 const { readClientLaunchSettings, setClientLaunchSettings, getClientLaunchArgs } = require('./client-launch-settings.js');
@@ -265,6 +266,7 @@ function codeBuddyForeignOwnerIds() {
 }
 const codeBuddyNative = PROFILE.kind === 'codebuddy' ? createCodeBuddyNative({profile: PROFILE, WebSocketCtor}) : null;
 const accountCreditCache = createAccountCreditCache(DATA_DIR);
+const smartScheduler = createSmartScheduler(DATA_DIR); // [wd-scheduler] 二改：智能调度熔断器
 const thirdPartyModels = createThirdPartyImport({ targetFile: workbuddyModelsFile(), dataDir: DATA_DIR });
 const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.existsSync(accountBackupFile(uid)));
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
@@ -11073,6 +11075,71 @@ function handleApi(req, res) {
         return json(res, 500, { ok: false, error: e.message });
       }
     });
+  }
+
+  // [wd-scheduler] 二改：智能调度选号。与 /api/credit-rotation 同源取数，
+  // 但带熔断器：冷却中的账号不参与选号；force=true 时跳过「当前临期不晚于候选」的保守检查。
+  if (req.method === 'POST' && p === '/api/scheduler/pick') {
+    return readBody(req).then(async (body) => {
+      const uid = String(body && body.uid || '').trim();
+      const force = (body && body.force) === true;
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(uid)) return json(res, 400, { ok: false, error: 'uid 格式无效' });
+      const current = currentAccount();
+      if (!current || String(current.uid) !== uid) return json(res, 409, { ok: false, error: '当前账号已发生变化' });
+      try {
+        const file = accountBackupFile(uid);
+        if (!fs.existsSync(file)) return json(res, 404, { ok: false, error: '账号备份不存在' });
+        const raw = wdCompatDecryptAuthJson(JSON.parse(fs.readFileSync(file, 'utf8'))); // [wd-compat]
+        const token = wdCompatAuthToken(raw && raw.auth);
+        if (!token) return json(res, 400, { ok: false, error: '备份中无 accessToken' });
+        const refreshed = await fetchCredits(token, raw.account || {});
+        // 当前账号积分已耗尽时自动记熔断（insufficient），供状态面板展示
+        if (refreshed && refreshed.unlimited !== true) {
+          const total = (Array.isArray(refreshed.segments) ? refreshed.segments : [])
+            .reduce((sum, segment) => sum + (Number(segment && segment.remaining) || 0), 0);
+          if (total <= 1 && !smartScheduler.isOpen(uid)) smartScheduler.report(uid, 'insufficient', false);
+        }
+        let accounts;
+        try { accounts = await refreshCreditRotationAccounts(uid, refreshed); }
+        catch (_) { return json(res, 200, { ok: true, candidate: null, current: { uid, segments: refreshed.segments }, breakers: smartScheduler.breakerList() }); }
+        const best = smartScheduler.pickCandidate(accounts, uid, { force, now: Date.now() });
+        if (!best) return json(res, 200, { ok: true, candidate: null, current: { uid, segments: refreshed.segments }, breakers: smartScheduler.breakerList() });
+        return json(res, 200, {
+          ok: true,
+          candidate: {
+            uid: best.account.uid,
+            nickname: best.account.nickname || '',
+            remaining: best.segment.remaining,
+            expiresAt: best.segment.expiresAt,
+          },
+          current: { uid, segments: refreshed.segments },
+          breakers: smartScheduler.breakerList(),
+          generatedAt: Date.now(),
+        });
+      } catch (e) {
+        log(`[scheduler] 选号查询 ${uid} 失败: ${e.message}`);
+        if (e && e.expired) {
+          smartScheduler.report(uid, 'expired', false);
+          return json(res, 401, { ok: false, expired: true, error: '登录身份过期' });
+        }
+        return json(res, 500, { ok: false, error: e.message });
+      }
+    });
+  }
+
+  // [wd-scheduler] 二改：上报账号调用结果，驱动熔断器。
+  if (req.method === 'POST' && p === '/api/scheduler/report') {
+    return readBody(req).then((body) => {
+      const uid = String(body && body.uid || '').trim();
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(uid)) return json(res, 400, { ok: false, error: 'uid 格式无效' });
+      const result = smartScheduler.report(uid, String(body && body.type || ''), (body && body.ok) === true);
+      return json(res, 200, { ok: true, result });
+    });
+  }
+
+  // [wd-scheduler] 二改：查看熔断状态。
+  if (req.method === 'GET' && p === '/api/scheduler/status') {
+    return json(res, 200, { ok: true, breakers: smartScheduler.breakerList() });
   }
 
   if (req.method === 'GET' && p === '/api/token-stats') {
